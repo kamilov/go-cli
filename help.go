@@ -46,6 +46,8 @@ type FlagInfo struct {
 	ValueName  string
 	Repeatable bool // list, map or counter
 	Negatable  bool
+	// Default and HasDefault describe a default set with Default. A default
+	// computed by DefaultFunc is not known in advance and is not reported.
 	Default    string
 	HasDefault bool
 	Choices    []string

@@ -67,7 +67,7 @@ func (c *Command) Complete(ctx context.Context, args []string, opts ...RunOption
 
 	st.chain = p.chain
 	ctx = context.WithValue(ctx, stateKey{}, st)
-	_ = resolve(st, p, true)
+	_ = resolve(ctx, st, p, true)
 
 	var fn CompleteFunc
 	switch {

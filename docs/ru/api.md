@@ -32,7 +32,7 @@ Import path: `github.com/kamilov/go-cli`. Имя пакета: `cli`.
 | `Check(fn)` | Проверка структуры после проверки отдельных значений. |
 | `Wrap(fn)` | Wrapper для команды и поддерева. |
 
-Для `Flag`, `List` и `Map` доступны `Short`, `Env`, `Describe`, `Default`, `Parse`, `Required`, `Hidden`, `Deprecated`, `Check`, `Complete`.
+Для `Flag`, `List` и `Map` доступны `Short`, `Env`, `Describe`, `Default`, `DefaultFunc`, `Parse`, `Required`, `Hidden`, `Deprecated`, `Check`, `Complete`.
 Для `Arg` доступны `Describe`, `Default`, `Optional`, `Parse`, `Check`, `Complete`.
 Для `Args` доступны `Describe`, `Optional`, `Parse`, `Check`, `Complete`.
 

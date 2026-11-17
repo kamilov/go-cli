@@ -55,14 +55,15 @@ type flagDef struct {
 	valueName string
 	choices   []string
 	defText   string
-	hasDef    bool
+	hasDef    bool // a default known when the tree is built, shown in help
+	defaulted bool // a default of any kind, known or computed by DefaultFunc
 	complete  CompleteFunc
 	source    Source
 
 	reset        func()
 	set          func(raw string) error // one command-line occurrence
 	setEnv       func(raw string) error // the whole environment value
-	applyDefault func()
+	applyDefault func(ctx context.Context) error
 	validate     func() error    // allowed values and checks of the current value
 	check        func() []string // schema problems; fills the display fields
 }
@@ -150,13 +151,15 @@ func notOneOf(v any, choices []string) error {
 // Flag describes a single-value flag. Its methods set properties that apply
 // to a field of any type and return the same descriptor.
 type Flag[T any] struct {
-	b       *Builder
-	d       *flagDef
-	parse   func(string) (T, error)
-	def     T
-	hasDef  bool
-	allowed func(T) bool
-	checks  []func(T) error
+	b     *Builder
+	d     *flagDef
+	parse func(string) (T, error)
+	defFn func(context.Context) (T, error)
+	// def is the value given to Default, kept for the schema check and help.
+	def      T
+	defKnown bool
+	allowed  func(T) bool
+	checks   []func(T) error
 }
 
 // Flag declares a flag bound to the field p. The parser is chosen by the field
@@ -202,7 +205,13 @@ func (b *Builder) Flag[T any](p *T, name string, opts ...FlagOption[T]) *Flag[T]
 		}
 		return err
 	}
-	d.applyDefault = func() { *p = f.def }
+	d.applyDefault = func(ctx context.Context) error {
+		v, err := f.defFn(ctx)
+		if err == nil {
+			*p = v
+		}
+		return err
+	}
 	d.validate = func() error { return f.validate(*p) }
 	d.check = func() []string {
 		var problems []string
@@ -212,10 +221,13 @@ func (b *Builder) Flag[T any](p *T, name string, opts ...FlagOption[T]) *Flag[T]
 		case f.parse == nil:
 			problems = append(problems, noParser(p, "Parse", "List", "Map"))
 		}
-		if f.hasDef {
+		if f.defFn != nil {
+			d.defaulted = true
 			if d.required {
 				problems = append(problems, "required flag cannot have a default value")
 			}
+		}
+		if f.defKnown {
 			if err := f.validate(f.def); err != nil {
 				problems = append(problems, "invalid default value: "+err.Error())
 			}
@@ -267,10 +279,27 @@ func (f *Flag[T]) Describe(text string) *Flag[T] {
 }
 
 // Default sets the value used when neither the command line nor the
-// environment provides one. It is checked when the tree is built.
+// environment provides one. It is checked when the tree is built and shown in
+// help. It replaces an earlier Default or DefaultFunc.
 func (f *Flag[T]) Default(v T) *Flag[T] {
 	if f.b.open() {
-		f.def, f.hasDef = v, true
+		f.defFn = func(context.Context) (T, error) { return v, nil }
+		f.def, f.defKnown = v, true
+	}
+	return f
+}
+
+// DefaultFunc sets the function that computes the default value. It is called
+// on every run in which neither the command line nor the environment provides
+// a value, and not for help. The result goes through the allowed values and
+// checks at that moment, so a wrong result is found only in such a run; it is
+// not shown in help. An error of the function or of a check is returned as a
+// plain error, not an InputError. Values of ancestors are available through
+// Parent; flags are resolved in declaration order, so fields of the same
+// command may not be set yet. It replaces an earlier Default or DefaultFunc.
+func (f *Flag[T]) DefaultFunc(fn func(ctx context.Context) (T, error)) *Flag[T] {
+	if f.b.accept(fn == nil, "flag --"+f.d.name, "DefaultFunc") {
+		f.defFn, f.defKnown = fn, false
 	}
 	return f
 }
@@ -330,13 +359,15 @@ func (f *Flag[T]) Complete(fn CompleteFunc) *Flag[T] {
 // List describes a flag bound to a slice. Each occurrence on the command line
 // adds an element; the environment variable holds comma-separated elements.
 type List[E any] struct {
-	b       *Builder
-	d       *flagDef
-	parse   func(string) (E, error)
-	def     []E
-	hasDef  bool
-	allowed func(E) bool
-	checks  []func([]E) error
+	b     *Builder
+	d     *flagDef
+	parse func(string) (E, error)
+	defFn func(context.Context) ([]E, error)
+	// def holds the elements given to Default, for the schema check and help.
+	def      []E
+	defKnown bool
+	allowed  func(E) bool
+	checks   []func([]E) error
 }
 
 // List declares a repeatable flag bound to the slice p. The element parser is
@@ -377,7 +408,13 @@ func (b *Builder) List[E any](p *[]E, name string, opts ...ListOption[E]) *List[
 	}
 	// The default is copied on every use so that a run changing the slice
 	// does not change the default of the next run.
-	d.applyDefault = func() { *p = slices.Clone(l.def) }
+	d.applyDefault = func(ctx context.Context) error {
+		v, err := l.defFn(ctx)
+		if err == nil {
+			*p = slices.Clone(v)
+		}
+		return err
+	}
 	d.validate = func() error { return l.validate(*p) }
 	d.check = func() []string {
 		var problems []string
@@ -387,10 +424,13 @@ func (b *Builder) List[E any](p *[]E, name string, opts ...ListOption[E]) *List[
 		case l.parse == nil:
 			problems = append(problems, noParser(elem, "Parse"))
 		}
-		if l.hasDef {
+		if l.defFn != nil {
+			d.defaulted = true
 			if d.required {
 				problems = append(problems, "required flag cannot have a default value")
 			}
+		}
+		if l.defKnown {
 			if err := l.validate(l.def); err != nil {
 				problems = append(problems, "invalid default value: "+err.Error())
 			}
@@ -447,10 +487,22 @@ func (l *List[E]) Describe(text string) *List[E] {
 }
 
 // Default sets the elements used when neither the command line nor the
-// environment provides any. They are copied on every use.
+// environment provides any. They are checked when the tree is built, shown in
+// help and copied on every use. It replaces an earlier Default or DefaultFunc.
 func (l *List[E]) Default(values ...E) *List[E] {
 	if l.b.open() {
-		l.def, l.hasDef = slices.Clone(values), true
+		def := slices.Clone(values)
+		l.defFn = func(context.Context) ([]E, error) { return def, nil }
+		l.def, l.defKnown = def, true
+	}
+	return l
+}
+
+// DefaultFunc sets the function that computes the default elements. It is
+// called and checked as described in Flag.DefaultFunc; its result is copied.
+func (l *List[E]) DefaultFunc(fn func(ctx context.Context) ([]E, error)) *List[E] {
+	if l.b.accept(fn == nil, "flag --"+l.d.name, "DefaultFunc") {
+		l.defFn, l.defKnown = fn, false
 	}
 	return l
 }
@@ -509,12 +561,14 @@ func (l *List[E]) Complete(fn CompleteFunc) *List[E] {
 // key=value and a repeated key replaces the value; the environment variable
 // holds k=v,k2=v2.
 type Map[V any] struct {
-	b      *Builder
-	d      *flagDef
-	parse  func(string) (V, error)
-	def    map[string]V
-	hasDef bool
-	checks []func(map[string]V) error
+	b     *Builder
+	d     *flagDef
+	parse func(string) (V, error)
+	defFn func(context.Context) (map[string]V, error)
+	// def holds the map given to Default, for the schema check and help.
+	def      map[string]V
+	defKnown bool
+	checks   []func(map[string]V) error
 }
 
 // Map declares a repeatable key=value flag bound to the map p. The value
@@ -555,7 +609,13 @@ func (b *Builder) Map[V any](p *map[string]V, name string) *Map[V] {
 		return nil
 	}
 	// Copied on every use, as for lists.
-	d.applyDefault = func() { *p = maps.Clone(m.def) }
+	d.applyDefault = func(ctx context.Context) error {
+		v, err := m.defFn(ctx)
+		if err == nil {
+			*p = maps.Clone(v)
+		}
+		return err
+	}
 	d.validate = func() error { return m.validate(*p) }
 	d.check = func() []string {
 		var problems []string
@@ -565,10 +625,13 @@ func (b *Builder) Map[V any](p *map[string]V, name string) *Map[V] {
 		case m.parse == nil:
 			problems = append(problems, noParser(elem, "Parse"))
 		}
-		if m.hasDef {
+		if m.defFn != nil {
+			d.defaulted = true
 			if d.required {
 				problems = append(problems, "required flag cannot have a default value")
 			}
+		}
+		if m.defKnown {
 			if err := m.validate(m.def); err != nil {
 				problems = append(problems, "invalid default value: "+err.Error())
 			}
@@ -622,10 +685,22 @@ func (m *Map[V]) Describe(text string) *Map[V] {
 }
 
 // Default sets the map used when neither the command line nor the environment
-// provides any entries. It is copied on every use.
+// provides any entries. It is checked when the tree is built, shown in help
+// and copied on every use. It replaces an earlier Default or DefaultFunc.
 func (m *Map[V]) Default(v map[string]V) *Map[V] {
 	if m.b.open() {
-		m.def, m.hasDef = maps.Clone(v), true
+		def := maps.Clone(v)
+		m.defFn = func(context.Context) (map[string]V, error) { return def, nil }
+		m.def, m.defKnown = def, true
+	}
+	return m
+}
+
+// DefaultFunc sets the function that computes the default map. It is called
+// and checked as described in Flag.DefaultFunc; its result is copied.
+func (m *Map[V]) DefaultFunc(fn func(ctx context.Context) (map[string]V, error)) *Map[V] {
+	if m.b.accept(fn == nil, "flag --"+m.d.name, "DefaultFunc") {
+		m.defFn, m.defKnown = fn, false
 	}
 	return m
 }

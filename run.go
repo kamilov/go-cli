@@ -225,7 +225,7 @@ func (c *Command) Run(ctx context.Context, args []string, opts ...RunOption) err
 
 	st.chain = p.chain
 	ctx = context.WithValue(ctx, stateKey{}, st)
-	if err := resolve(st, p, false); err != nil {
+	if err := resolve(ctx, st, p, false); err != nil {
 		return err
 	}
 	warnDeprecated(st)
@@ -245,9 +245,9 @@ func (c *Command) Run(ctx context.Context, args []string, opts ...RunOption) err
 
 // resolve fills the bound fields of the selected command and its ancestors.
 // A source is taken whole: the command line, otherwise the environment,
-// otherwise the default. In lenient mode a value that fails to convert is
-// skipped instead of reported.
-func resolve(st *runState, p *parser, lenient bool) error {
+// otherwise the default. In lenient mode a value that fails to convert, and a
+// default that fails to compute, is skipped instead of reported.
+func resolve(ctx context.Context, st *runState, p *parser, lenient bool) error {
 	sel := p.cur()
 	for _, c := range st.chain {
 		for _, d := range c.flags {
@@ -256,7 +256,21 @@ func resolve(st *runState, p *parser, lenient bool) error {
 					return &InputError{Path: sel.path(), Err: err}
 				}
 				d.reset()
+				continue
 			}
+			if d.source != SourceUnset || !d.defaulted {
+				continue
+			}
+			// A failed default is not the user's mistake, so it is not an
+			// InputError.
+			if err := d.applyDefault(ctx); err != nil {
+				if !lenient {
+					return fmt.Errorf("flag --%s: default value: %w", d.name, err)
+				}
+				d.reset()
+				continue
+			}
+			d.source = SourceDefault
 		}
 	}
 	words := p.pos
@@ -307,10 +321,6 @@ func resolveFlag(st *runState, d *flagDef, raws []string) error {
 			return nil
 		}
 	}
-	if d.hasDef {
-		d.applyDefault()
-		d.source = SourceDefault
-	}
 	return nil
 }
 
@@ -344,6 +354,11 @@ func verify(ctx context.Context, st *runState) error {
 			}
 			if d.source != SourceUnset {
 				if err := d.validate(); err != nil {
+					// A known default is checked when the tree is built, so
+					// only a computed one can fail here.
+					if d.source == SourceDefault {
+						return fmt.Errorf("flag --%s: default value: %w", d.name, err)
+					}
 					return inputErrorf(sel, "flag --%s: %w", d.name, err)
 				}
 			}

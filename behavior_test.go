@@ -475,6 +475,14 @@ func TestSchemaErrors(t *testing.T) {
 		{"invalid flag name", func() *cli.Command {
 			return cli.New("t", func(b *cli.Builder, a *args) { b.Flag(&a.S, "-s") }, nil)
 		}, `invalid flag name "-s"`},
+		{"required with computed default", func() *cli.Command {
+			return cli.New("t", func(b *cli.Builder, a *args) {
+				b.Flag(&a.S, "s").Required().DefaultFunc(func(context.Context) (string, error) { return "x", nil })
+			}, nil)
+		}, "flag --s: required flag cannot have a default value"},
+		{"nil default function", func() *cli.Command {
+			return cli.New("t", func(b *cli.Builder, a *args) { b.List(&a.Tags, "tag").DefaultFunc(nil) }, nil)
+		}, "flag --tag: DefaultFunc called with a nil function"},
 		{"nil parser", func() *cli.Command {
 			return cli.New("t", func(b *cli.Builder, a *args) { b.Flag(&a.S, "s").Parse(nil) }, nil)
 		}, "flag --s: Parse called with a nil function"},
@@ -836,5 +844,175 @@ func TestSuggestions(t *testing.T) {
 		if err == nil || err.Error() != tc.want {
 			t.Errorf("%v: got %v, want %q", tc.args, err, tc.want)
 		}
+	}
+}
+
+func TestDefaultFuncRunsOnlyWithoutOtherSources(t *testing.T) {
+	type global struct{ Home string }
+	type args struct{ Config string }
+	calls := 0
+	var got args
+	var src cli.Source
+	app := cli.New("tool", func(b *cli.Builder, g *global) { b.Flag(&g.Home, "home").Default("/home/u") }, nil)
+	app.Command("show", func(b *cli.Builder, a *args) {
+		b.Flag(&a.Config, "config").Env("CONFIG").DefaultFunc(func(ctx context.Context) (string, error) {
+			calls++
+			g, ok := cli.Parent[global](ctx)
+			if !ok {
+				return "", errors.New("no parent")
+			}
+			return g.Home + "/.toolrc", nil
+		})
+	}, func(ctx context.Context, a *args) error {
+		got, src = *a, cli.SourceOf(ctx, &a.Config)
+		return nil
+	})
+	ctx := context.Background()
+
+	if _, err := run(app, "show", "--home", "/root"); err != nil {
+		t.Fatal(err)
+	}
+	if got.Config != "/root/.toolrc" || src != cli.SourceDefault || calls != 1 {
+		t.Fatalf("got %+v, source %v, calls %d", got, src, calls)
+	}
+	if _, err := run(app, "show", "--config", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := app.Run(ctx, []string{"show"}, envOf(map[string]string{"CONFIG": "y"})); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("called %d times with a value from the command line or the environment", calls)
+	}
+
+	o, err := run(app, "show", "-h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatal("help called the default function")
+	}
+	for line := range strings.Lines(o.stdout.String()) {
+		if strings.Contains(line, "--config") && strings.Contains(line, "default:") {
+			t.Fatalf("computed default shown in help: %q", line)
+		}
+	}
+	if info := app.Info().Commands[0].Flags[0]; info.HasDefault || info.Default != "" {
+		t.Fatalf("info reports a computed default: %+v", info)
+	}
+}
+
+func TestFailedComputedDefaultIsNotInputError(t *testing.T) {
+	type args struct {
+		S string
+		N int
+	}
+	errNoHome := errors.New("no home")
+	cases := []struct {
+		name string
+		bind func(*cli.Builder, *args)
+		want string
+	}{
+		{"function error", func(b *cli.Builder, a *args) {
+			b.Flag(&a.S, "s").DefaultFunc(func(context.Context) (string, error) { return "", errNoHome })
+		}, "flag --s: default value: no home"},
+		{"not allowed", func(b *cli.Builder, a *args) {
+			b.Flag(&a.S, "s", cli.OneOf("a", "b")).DefaultFunc(func(context.Context) (string, error) { return "c", nil })
+		}, `flag --s: default value: value "c" is not one of: a, b`},
+		{"check fails", func(b *cli.Builder, a *args) {
+			b.Flag(&a.N, "n").Check(func(n int) error {
+				if n < 0 {
+					return errors.New("negative")
+				}
+				return nil
+			}).DefaultFunc(func(context.Context) (int, error) { return -1, nil })
+		}, "flag --n: default value: negative"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ran := false
+			app := cli.New("tool", tc.bind, func(context.Context, *args) error { ran = true; return nil })
+			if err := app.Err(); err != nil {
+				t.Fatalf("schema error: %v", err)
+			}
+			_, err := run(app)
+			if err == nil || err.Error() != tc.want {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+			if _, ok := errors.AsType[*cli.InputError](err); ok {
+				t.Fatal("failed default reported as input error")
+			}
+			if ran {
+				t.Fatal("handler ran")
+			}
+		})
+	}
+
+	app := cli.New("tool", cases[0].bind, func(context.Context, *args) error { return nil })
+	if _, err := run(app); !errors.Is(err, errNoHome) {
+		t.Fatalf("function error is not wrapped: %v", err)
+	}
+}
+
+func TestComputedListAndMapDefaultsAreCopied(t *testing.T) {
+	type args struct {
+		Tags   []string
+		Labels map[string]string
+	}
+	tags := []string{"base"}
+	labels := map[string]string{"env": "dev"}
+	app := cli.New("tool", func(b *cli.Builder, a *args) {
+		b.List(&a.Tags, "tag").DefaultFunc(func(context.Context) ([]string, error) { return tags, nil })
+		b.Map(&a.Labels, "label").DefaultFunc(func(context.Context) (map[string]string, error) { return labels, nil })
+	}, func(_ context.Context, a *args) error {
+		a.Tags[0] = "changed"
+		a.Labels["env"] = "changed"
+		return nil
+	})
+	if _, err := run(app); err != nil {
+		t.Fatal(err)
+	}
+	if tags[0] != "base" || labels["env"] != "dev" {
+		t.Fatalf("run changed the source of the default: %v %v", tags, labels)
+	}
+}
+
+func TestLastDefaultDeclarationWins(t *testing.T) {
+	type args struct{ A, B string }
+	var got args
+	app := cli.New("tool", func(b *cli.Builder, a *args) {
+		b.Flag(&a.A, "a").Default("known").DefaultFunc(func(context.Context) (string, error) { return "computed", nil })
+		b.Flag(&a.B, "b").DefaultFunc(func(context.Context) (string, error) { return "computed", nil }).Default("known")
+	}, func(_ context.Context, a *args) error { got = *a; return nil })
+	if err := app.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := run(app); err != nil {
+		t.Fatal(err)
+	}
+	if got.A != "computed" || got.B != "known" {
+		t.Fatalf("got %+v", got)
+	}
+	flags := app.Info().Flags
+	if flags[0].HasDefault || !flags[1].HasDefault || flags[1].Default != "known" {
+		t.Fatalf("help defaults: %+v", flags[:2])
+	}
+}
+
+func TestCompletionSkipsFailedComputedDefault(t *testing.T) {
+	type args struct{ Region, Name string }
+	var seen []string
+	app := cli.New("tool", func(b *cli.Builder, a *args) {
+		b.Flag(&a.Region, "region").DefaultFunc(func(context.Context) (string, error) { return "", errors.New("offline") })
+		b.Flag(&a.Name, "name").DefaultFunc(func(context.Context) (string, error) { return "n", nil }).
+			Complete(func(ctx context.Context, _ string) ([]cli.Candidate, error) {
+				seen = append(seen, a.Region, fmt.Sprint(cli.SourceOf(ctx, &a.Region)), a.Name)
+				return nil, nil
+			})
+	}, nil)
+	_, err := app.Complete(context.Background(), []string{"--name", ""}, noEnv)
+	want := []string{"", fmt.Sprint(cli.SourceUnset), "n"}
+	if err != nil || !slices.Equal(seen, want) {
+		t.Fatalf("seen %q, want %q, err %v", seen, want, err)
 	}
 }
